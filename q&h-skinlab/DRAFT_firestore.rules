@@ -1,0 +1,138 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'Quản trị viên';
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Validation Helpers ---
+
+    function isValidProduct(data) {
+      return data.keys().hasAll(['name', 'price', 'image']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             data.price is number && data.price >= 0 &&
+             data.image is string && data.image.size() <= 1000 &&
+             (data.get('oldPrice', 0) is number) &&
+             (data.get('brand', '') is string) &&
+             (data.get('category', '') is string);
+    }
+
+    function isValidCategory(data) {
+      return data.keys().hasAll(['name', 'slug']) &&
+             data.name is string && data.name.size() <= 100 &&
+             data.slug is string && data.slug.size() <= 100;
+    }
+
+    function isValidOrder(data) {
+      return data.keys().hasAll(['userId', 'items', 'totalPrice', 'status', 'isPaid', 'createdAt']) &&
+             data.userId == (isSignedIn() ? request.auth.uid : data.userId) && // If signed in, must match UID
+             data.items is list && data.items.size() > 0 &&
+             data.totalPrice is number &&
+             data.status in ['Chờ xác nhận', 'Chờ lấy hàng', 'Đang giao', 'Đã giao', 'Đã huỷ'] &&
+             data.isPaid is bool &&
+             data.createdAt is string; // Simplified for draft
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['name', 'email', 'role', 'createdAt']) &&
+             data.name is string && data.name.size() <= 100 &&
+             data.email is string && data.email.size() <= 100 &&
+             data.role in ['Khách hàng', 'Quản trị viên'] &&
+             data.createdAt is string;
+    }
+
+    function isValidMagazine(data) {
+      return data.keys().hasAll(['title', 'category', 'thumbnail', 'content', 'createdAt']) &&
+             data.title is string && data.title.size() <= 200 &&
+             data.content is string &&
+             data.createdAt is string;
+    }
+
+    // --- Collection Rules ---
+
+    match /products/{productId} {
+      allow read: if true;
+      allow create: if isAdmin() && isValidProduct(incoming());
+      allow update: if isAdmin() && isValidProduct(incoming());
+      allow delete: if isAdmin();
+    }
+
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow create: if isAdmin() && isValidCategory(incoming());
+      allow update: if isAdmin() && isValidCategory(incoming());
+      allow delete: if isAdmin();
+    }
+
+    match /orders/{orderId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow list: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      
+      allow create: if isValidOrder(incoming());
+      
+      allow update: if (isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid)) &&
+                     isValidOrder(incoming()) && (
+                       // Admin action: Change status or payment
+                       isAdmin() || 
+                       // User action: Cancel if pending
+                       (resource.data.status == 'Chờ xác nhận' && 
+                        incoming().diff(existing()).affectedKeys().hasOnly(['status']) &&
+                        incoming().status == 'Đã huỷ')
+                     );
+      allow delete: if isAdmin();
+    }
+
+    match /magazine/{articleId} {
+      allow read: if true;
+      allow create: if isAdmin() && isValidMagazine(incoming());
+      allow update: if isAdmin() && isValidMagazine(incoming());
+      allow delete: if isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if isAdmin() || isOwner(userId);
+      allow list: if isAdmin();
+      
+      allow create: if isOwner(userId) && isValidUser(incoming()) && incoming().role == 'Khách hàng';
+      allow update: if (isAdmin() || isOwner(userId)) &&
+                     isValidUser(incoming()) && (
+                       isAdmin() || (
+                         isOwner(userId) && 
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email'])
+                       )
+                     );
+      allow delete: if isAdmin();
+    }
+  }
+}
